@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -37,6 +38,9 @@ from grid_engine import evaluate_manager_grid_splitter
 from instruction_reader import parse_instruction_excel
 
 TEMPLATE_HEADERS = ["证券代码", "证券名称", "产品名称", "单元名称", "交易市场", "委托方向", "数量/仓位", "极限价格"]
+BASKET_TEMPLATE_HEADERS = ["证券代码", "证券名称", "交易市场", "委托方向", "价格类型", "指令价格", "指令数量", "指令金额", "净值比例(%)"]
+BASKET_LOT_SIZE = 100
+HK_CHANNEL_MAP: Dict[str, str] = {}
 
 
 DEFAULT_INSTRUCTION_DIR_NAME = "指令"
@@ -196,7 +200,42 @@ def find_template_file(project_root: Path, market: str) -> Path:
     return chosen
 
 
+def find_basket_template_file(project_root: Path) -> Path:
+    candidates = [
+        p for p in project_root.glob("现货篮子指令参考模板*.xlsx")
+        if p.is_file() and not p.name.startswith("~$")
+    ]
+    chosen = pick_latest_file(candidates)
+    if not chosen:
+        raise FileNotFoundError(
+            f"没有在 {project_root} 找到现货篮子指令参考模板.xlsx，请放在项目根目录，或用 --basket-template 指定。"
+        )
+    return chosen
+
+
 def find_initial_position_file(project_root: Path) -> str:
+    holdings_dir = project_root / "持仓数据"
+    snapshots = [
+        p for p in holdings_dir.glob("全球产品持仓查询_*.xls*")
+        if p.is_file() and not p.name.startswith("~$")
+    ]
+
+    def snapshot_sort_key(path: Path) -> Tuple[datetime, float, str]:
+        match = re.search(r"(?<!\d)(20\d{6})(?!\d)", path.stem)
+        try:
+            snapshot_date = datetime.strptime(match.group(1), "%Y%m%d") if match else datetime.min
+        except ValueError:
+            snapshot_date = datetime.min
+        return snapshot_date, path.stat().st_mtime, path.name
+
+    latest_snapshot = max(
+        snapshots,
+        key=snapshot_sort_key,
+        default=None,
+    )
+    if latest_snapshot:
+        return str(latest_snapshot)
+
     patterns = ["初始持仓*.xls*", "*初始*持仓*.xls*", "*持仓*.xls*", "position*.xls*", "positions*.xls*"]
     candidates: List[Path] = []
     excluded_keywords = ["active_grid", "delta_ledger", "买卖清单", "模板", "复核报告"]
@@ -231,6 +270,8 @@ def resolve_runtime_inputs(args: argparse.Namespace) -> argparse.Namespace:
         args.a_template = str(find_template_file(root, "A"))
     if not getattr(args, "hk_template", ""):
         args.hk_template = str(find_template_file(root, "HK"))
+    if not getattr(args, "basket_template", ""):
+        args.basket_template = str(find_basket_template_file(root))
     # 默认输出和状态目录放在 live_grid_project 下面，方便每天复用 state。
     if not getattr(args, "output_dir", ""):
         args.output_dir = str(root / "outputs_live_grid")
@@ -254,6 +295,7 @@ def resolve_runtime_inputs(args: argparse.Namespace) -> argparse.Namespace:
     print(f"oplus文件：{args.oplus_file}")
     print(f"A股模板：{args.a_template}")
     print(f"港股模板：{args.hk_template}")
+    print(f"现货篮子参考模板：{args.basket_template}")
     mode_label = "增量状态模式" if getattr(args, "incremental_state_mode", False) else "固定持仓基线重算模式"
     position_label = args.position_file if args.position_file else "未提供；将使用 state/current_positions.csv"
     print(f"计算模式：{mode_label}")
@@ -281,12 +323,9 @@ PRODUCT_ALIAS = {
     "好买新方程": "新方程",
 }
 
-NAV_COL_CANDIDATES = [
-    "产品净资产", "净资产", "基金净资产", "资产净值", "产品资产净值",
-    "净资产(元)", "净资产（元）", "资产净值(元)", "资产净值（元）",
-]
 MARKET_VALUE_COL_CANDIDATES = [
-    "证券市值", "持仓市值", "股票市值", "市值(元)", "市值（元）", "市值",
+    "持仓市值（人民币）", "持仓市值(人民币)", "证券市值", "持仓市值", "股票市值",
+    "市值(元)", "市值（元）", "市值",
 ]
 
 POSITION_COL_CANDIDATES = [
@@ -423,6 +462,19 @@ def trade_market(code: str) -> str:
 
 def trade_direction(side: str) -> str:
     return "买入" if str(side).lower() == "buy" else "卖出"
+
+
+def basket_trade_market(code: str) -> str:
+    code = canonical_code(code)
+    if code.endswith(".SH"):
+        return "1-上海"
+    if code.endswith(".SZ"):
+        return "2-深圳"
+    if code.endswith(".BJ"):
+        return "3-北交所"
+    if code.endswith(".HK"):
+        return HK_CHANNEL_MAP.get(code, "港股通(沪)")
+    return ""
 
 
 def normalize_product_name(x: Any) -> str:
@@ -593,6 +645,103 @@ def export_import_template(orders_df: pd.DataFrame, template_path: str | Path, o
     # 模板保存时视图可能停在靠后的行（港股模板 topLeftCell=A11），冻结首行后会导致
     # 打开时前十几行被滚到冻结区上方、看起来“前十几行消失/第一行不显示”。
     # 清除 sheetView 自身的视图位置，交给 pane 的 topLeftCell 决定顶部。
+    ws.sheet_view.topLeftCell = None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
+def export_basket_reference_template(
+    orders_df: pd.DataFrame,
+    positions: pd.DataFrame,
+    product_nav: float,
+    template_path: str | Path,
+    output_path: str | Path,
+) -> Path:
+    """Export simulated fills as fixed-share orders in the spot basket template."""
+    has_orders = orders_df is not None and not orders_df.empty
+    if has_orders and (not np.isfinite(product_nav) or product_nav <= 0):
+        raise ValueError(f"现货篮子固定数量需要有效基金净值，当前净值为 {product_nav!r}。")
+
+    template_path = Path(template_path)
+    output_path = Path(output_path)
+    wb = load_workbook(template_path)
+    ws = wb[wb.sheetnames[0]]
+    headers = [ws.cell(1, c).value for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1)]
+    if headers != BASKET_TEMPLATE_HEADERS:
+        raise ValueError(f"现货篮子模板表头不匹配：{headers}，期望={BASKET_TEMPLATE_HEADERS}")
+    style_row = 2 if ws.max_row >= 2 else 1
+    price_type = ws.cell(style_row, 5).value or "1-最新价"
+
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1):
+            ws.cell(r, c).value = None
+
+    running_positions: Dict[Tuple[str, str, str], float] = {}
+    if positions is not None and not positions.empty:
+        for _, position in positions.iterrows():
+            key = (
+                normalize_product_name(position.get("product")),
+                normalize_unit_name(position.get("unit")),
+                canonical_code(position.get("code")),
+            )
+            running_positions[key] = _safe_float(position.get("current_pos"), 0.0)
+
+    rows = []
+    if has_orders:
+        ordered = orders_df
+        if "sim_first_fill_seq" in ordered.columns:
+            ordered = ordered.sort_values("sim_first_fill_seq", kind="stable")
+        for _, order in ordered.iterrows():
+            code = canonical_code(order.get("code"))
+            product = normalize_product_name(order.get("product"))
+            unit = normalize_unit_name(order.get("unit"))
+            key = (product, unit, code)
+            previous_pos = running_positions.get(key, 0.0)
+            target_pos = _safe_float(order.get("target_pos"), np.nan)
+            price = _safe_float(order.get("price"), np.nan)
+            if not np.isfinite(target_pos) or not np.isfinite(price) or price <= 0:
+                raise ValueError(
+                    f"现货篮子订单缺少有效目标仓位或价格：{code}，"
+                    f"target_pos={order.get('target_pos')!r}，price={order.get('price')!r}"
+                )
+
+            delta_pos = target_pos - previous_pos
+            side = str(order.get("side", "")).lower()
+            if delta_pos > 1e-12 and side != "buy":
+                raise ValueError(f"{code} 的目标仓位增加但模拟方向不是买入。")
+            if delta_pos < -1e-12 and side != "sell":
+                raise ValueError(f"{code} 的目标仓位减少但模拟方向不是卖出。")
+            running_positions[key] = target_pos
+
+            raw_quantity = abs(delta_pos) * product_nav / price
+            quantity = math.floor(raw_quantity / BASKET_LOT_SIZE + 1e-12) * BASKET_LOT_SIZE
+            if quantity <= 0:
+                continue
+            amount = round(quantity * price, 2)
+            nav_ratio = amount / product_nav * 100.0
+            rows.append([
+                code.split(".", 1)[0],
+                order.get("name", ""),
+                basket_trade_market(code),
+                "1-买入" if side == "buy" else "2-卖出",
+                price_type,
+                float(price),
+                int(quantity),
+                amount,
+                round(nav_ratio, 6),
+            ])
+
+    for r in range(ws.max_row + 1, max(len(rows), 1) + 2):
+        _copy_row_style(ws, style_row, r, len(BASKET_TEMPLATE_HEADERS))
+    for idx, values in enumerate(rows, start=2):
+        _copy_row_style(ws, style_row, idx, len(BASKET_TEMPLATE_HEADERS))
+        for c, value in enumerate(values, start=1):
+            ws.cell(idx, c).value = value
+    for r in range(len(rows) + 2, ws.max_row + 1):
+        for c in range(1, len(BASKET_TEMPLATE_HEADERS) + 1):
+            ws.cell(r, c).value = None
+
     ws.sheet_view.topLeftCell = None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -1000,6 +1149,10 @@ def _normalize_position_sheet(
         if product != SIM_PRODUCT_NAME:
             stats["skipped_other_product"] += 1
             continue
+        if code.endswith(".HK") and market_col:
+            channel = str(market_value or "").strip()
+            if channel in ("港股通(沪)", "港股通(深)"):
+                HK_CHANNEL_MAP[code] = channel
         pos = _position_value_to_fraction(r.get(pos_col), pos_col)
         if not np.isfinite(pos):
             stats["skipped_missing_position"] += 1
@@ -1046,6 +1199,7 @@ def load_position_file(path: Optional[str | Path], accounts: pd.DataFrame) -> pd
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"找不到 position file: {p}")
+    HK_CHANNEL_MAP.clear()
     sheets = read_excel_any(p, sheet_name=None)
     frames = []
     if not isinstance(sheets, dict):
@@ -1557,22 +1711,6 @@ def build_orders_for_code(
     return pd.DataFrame(active_rows), pd.DataFrame(new_rows), pd.DataFrame(check_rows)
 
 
-def _find_nav_col(columns: Iterable[Any]) -> Optional[str]:
-    """找真正的净资产绝对值列，排除“市值/净资产(%)”等比例字段。"""
-    cols = list(columns)
-    for cand in NAV_COL_CANDIDATES:
-        for c in cols:
-            cs = str(c).strip().replace("（", "(").replace("）", ")")
-            cc = cand.replace("（", "(").replace("）", ")")
-            if cs == cc and "/" not in cs and "%" not in cs and "％" not in cs and "比例" not in cs:
-                return c
-    for c in cols:
-        cs = str(c).strip()
-        if ("净资产" in cs or "资产净值" in cs) and "/" not in cs and "%" not in cs and "％" not in cs and "比例" not in cs:
-            return c
-    return None
-
-
 def _find_market_value_col(columns: Iterable[Any]) -> Optional[str]:
     """找证券市值列，但明确排除“市值/净资产”这类比例列。"""
     cols = list(columns)
@@ -1594,7 +1732,7 @@ def _find_market_value_col(columns: Iterable[Any]) -> Optional[str]:
 def infer_sim_product_nav(position_file: Optional[str | Path]) -> Tuple[float, str]:
     """从全球持仓查询里推断“净值线3号/巨杉网格化”的产品净资产。
 
-    优先直接读取净资产列；若没有，则用 证券市值 / 持仓占净资产比例 反推。
+    优先用人民币持仓市值最大的有效持仓行，通过证券市值 / 持仓占净资产比例反推。
     返回 (nav, source)。若无法推断则返回 (nan, reason)。
     """
     if not position_file:
@@ -1609,10 +1747,7 @@ def infer_sim_product_nav(position_file: Optional[str | Path]) -> Tuple[float, s
     if not isinstance(sheets, dict):
         sheets = {"Sheet1": sheets}
 
-    direct_values: List[float] = []
-    derived_values: List[float] = []
-    direct_sources: List[str] = []
-    derived_sources: List[str] = []
+    derived_values: List[Tuple[float, float, float, str]] = []
 
     for sheet_name, df in sheets.items():
         if df is None or df.empty:
@@ -1622,8 +1757,9 @@ def infer_sim_product_nav(position_file: Optional[str | Path]) -> Tuple[float, s
             continue
         date_col = _find_col(df.columns, POSITION_DATE_COL_CANDIDATES)
         pos_col = _find_col(df.columns, POSITION_COL_CANDIDATES)
-        nav_col = _find_nav_col(df.columns)
         mv_col = _find_market_value_col(df.columns)
+        code_col = _find_col(df.columns, CODE_COL_CANDIDATES)
+        name_col = _find_col(df.columns, NAME_COL_CANDIDATES)
 
         work = df.copy()
         if date_col is not None:
@@ -1637,16 +1773,6 @@ def infer_sim_product_nav(position_file: Optional[str | Path]) -> Tuple[float, s
         if work.empty:
             continue
 
-        if nav_col is not None:
-            vals = pd.to_numeric(
-                work[nav_col].astype(str).str.replace(",", "", regex=False),
-                errors="coerce",
-            )
-            vals = vals[(vals > 0) & np.isfinite(vals)]
-            if not vals.empty:
-                direct_values.extend(vals.tolist())
-                direct_sources.append(f"{sheet_name}:{nav_col}")
-
         if mv_col is not None and pos_col is not None:
             for _, r in work.iterrows():
                 mv = _safe_float(r.get(mv_col), np.nan)
@@ -1654,20 +1780,17 @@ def infer_sim_product_nav(position_file: Optional[str | Path]) -> Tuple[float, s
                 if np.isfinite(mv) and mv > 0 and np.isfinite(pos) and pos > 1e-8:
                     nav_est = float(mv / pos)
                     if np.isfinite(nav_est) and nav_est > 0:
-                        derived_values.append(nav_est)
-                        derived_sources.append(f"{sheet_name}:{mv_col}/{pos_col}")
+                        stock = str(r.get(code_col, "") or "") if code_col else ""
+                        if name_col:
+                            stock = f"{stock} {str(r.get(name_col, '') or '')}".strip()
+                        source = f"{sheet_name}:{stock or mv_col}/{mv_col}/{pos_col}"
+                        derived_values.append((mv, nav_est, pos, source))
 
-    if direct_values:
-        nav = float(np.nanmedian(np.array(direct_values, dtype=float)))
-        return nav, "直接净资产列: " + ", ".join(sorted(set(direct_sources)))
     if derived_values:
-        arr = np.array(derived_values, dtype=float)
-        if len(arr) >= 5:
-            lo, hi = np.nanquantile(arr, [0.1, 0.9])
-            arr = arr[(arr >= lo) & (arr <= hi)]
-        nav = float(np.nanmedian(arr)) if len(arr) else np.nan
-        return nav, "证券市值/持仓比例反推: " + ", ".join(sorted(set(derived_sources)))
-    return np.nan, "持仓文件中未找到可用于推断净资产的列"
+        reliable_values = [item for item in derived_values if item[2] >= 0.002]
+        mv, nav, _, source = max(reliable_values or derived_values, key=lambda item: item[0])
+        return nav, f"单只持仓反推: {source}"
+    return np.nan, "持仓文件中未找到有正人民币市值和有效仓位比例的股票"
 
 
 def _infer_volume_share_multiplier(minute_df: pd.DataFrame) -> float:
@@ -2176,7 +2299,9 @@ def main() -> int:
         print(f"模拟产品净资产：{sim_product_nav:,.2f}；来源={sim_nav_source}")
     else:
         print(f"WARNING: 无法自动得到 {SIM_PRODUCT_NAME} 净资产：{sim_nav_source}")
-        print("原始网格仍会正常输出；昨日分钟流动性模拟文件将为空。可用 --sim-nav 手动指定净资产。")
+        print("昨日分钟模拟成交需要基金净值计算固定数量；可用 --sim-nav 手动指定净资产。")
+        if not args.disable_liquidity_simulation:
+            raise ValueError(f"无法计算昨日分钟模拟成交所需基金净值：{sim_nav_source}")
 
     snapshot_all = build_instruction_snapshot(args.instruction_file, include_sheets=include_sheets)
     supported_mask = snapshot_all["code"].apply(market_group).isin(["A", "HK"])
@@ -2368,8 +2493,12 @@ def main() -> int:
     export_import_template(active_hk, args.hk_template, paths["active_hk_template"], freeze=False)
     export_import_template(new_a, args.a_template, paths["new_a_template"])
     export_import_template(new_hk, args.hk_template, paths["new_hk_template"], freeze=False)
-    export_import_template(simulated_a, args.a_template, paths["simulated_a_template"])
-    export_import_template(simulated_hk, args.hk_template, paths["simulated_hk_template"], freeze=False)
+    export_basket_reference_template(
+        simulated_a, positions, sim_product_nav, args.basket_template, paths["simulated_a_template"]
+    )
+    export_basket_reference_template(
+        simulated_hk, positions, sim_product_nav, args.basket_template, paths["simulated_hk_template"]
+    )
     export_manager_instruction_style(active_master, paths["manager_instruction"])
 
     print("\n========== 实盘网格生成完成 ==========")
@@ -2398,6 +2527,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--oplus-date", default="", help="oplus 文件日期，例如 0623 或 20260623；不填则运行时 input 询问")
     p.add_argument("--a-template", default="", help="A股买卖清单导入模板.xlsx；不填则从 live_grid_project 根目录自动寻找")
     p.add_argument("--hk-template", default="", help="港股买卖清单导入模板.xlsx；不填则从 live_grid_project 根目录自动寻找")
+    p.add_argument("--basket-template", default="", help="现货篮子指令参考模板.xlsx；不填则从项目根目录自动寻找")
     p.add_argument("--asof-date", default="", help="运行日期，例如 2026-06-23；不填默认今天")
     p.add_argument("--output-dir", default="", help="输出目录；默认 live_grid_project/outputs_live_grid")
     p.add_argument("--state-dir", default="", help="状态目录；默认 live_grid_project/state，建议不要随便删除")

@@ -144,6 +144,7 @@ python 日常代码/step2_grid.py ... --no-apply-oplus-trades --full-refresh
 | `实盘网格_A股/港股_当前全部网格_买卖清单导入.xlsx` | 当前全部在挂网格 |
 | `实盘网格_复核报告.xlsx` | 13 个 sheet：run_meta、product_navs(净值)、current_positions(持仓)、position_check(含跳过原因)、流动性、errors |
 | `实盘网格_昨日分钟流动性模拟.xlsx` | 3 个子表：可模拟成交网格、逐档成交核实、分钟流动性概览 |
+| `实盘网格_A股/港股_昨日分钟模拟成交_可导入.xlsx` | 使用“现货篮子指令参考模板”；按最新持仓净值、逐档仓位差计算数量，并向下取整到100股 |
 | `实盘网格_基金经理格式_当前全部网格.xlsx` | 经理格式查看 |
 
 ---
