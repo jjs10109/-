@@ -1,0 +1,6 @@
+numpy>=1.24
+pandas>=2.0
+openpyxl>=3.1
+xlrd>=2.0.1
+# Windows 如需用本机 Excel 作为 .xls 转换后备方案，可额外安装：pywin32
+# Wind 行情环境需要本机 WindPy。
